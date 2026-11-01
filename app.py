@@ -4,6 +4,7 @@
 import os
 import sqlite3
 from flask import Flask, jsonify, request
+from auth import utilisateur_connecte
 
 app = Flask(__name__)
 
@@ -64,23 +65,49 @@ def lister_notes():
         [{"id": r[0], "etudiant": r[1], "module": r[2], "note": r[3]} for r in rows]
     )
 
-# Modification d'une note par l'enseignant
-@app.route("/notes/<note_id>", methods=["PUT"])
+
+# Modification d'une note par l'enseignant du module
+@app.route("/notes/<int:note_id>", methods=["PUT"])
 def modifier_note(note_id):
-    # Clé du service qui prévient l'étudiant par e-mail
-    token = "sk_live_51H8ecole"
+    # Authentification : qui est l'utilisateur ?
+    utilisateur = utilisateur_connecte()
+    if utilisateur is None:
+        return jsonify(erreur="Identification requise"), 401
+
+    # Autorisation : seul un enseignant peut modifier une note
+    if utilisateur["role"] != "enseignant":
+        return jsonify(erreur="Accès refusé"), 403
+
+    # Validation : la note doit être un nombre entre 0 et 20
+    donnees = request.get_json(silent=True) or {}
+    note = donnees.get("note")
+    if isinstance(note, bool) or not isinstance(note, (int, float)) or not 0 <= note <= 20:
+        return jsonify(erreur="Note invalide"), 400
+
+    con = None
     try:
         con = sqlite3.connect(DB)
-        # Enregistre la nouvelle note
-        con.execute("UPDATE notes SET note = " + request.args["note"]
-                    + " WHERE id = " + note_id)
+        ligne = con.execute(
+            "SELECT module FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+        if ligne is None:
+            return jsonify(erreur="Note introuvable"), 404
+        # Autorisation : l'enseignant ne modifie que son propre module
+        if ligne[0] != utilisateur["module"]:
+            return jsonify(erreur="Accès refusé"), 403
+        con.execute("UPDATE notes SET note = ? WHERE id = ?", (note, note_id))
         con.commit()
-        # Garde une trace de la modification
-        print("Modification par", request.remote_addr, request.args)
-        return "OK"
-    except Exception as e:
-        # En cas de problème, informe l'utilisateur
-        return str(e), 500
+        # Trace de la modification : qui, quelle note
+        app.logger.info("Note %s modifiée par %s", note_id, utilisateur["nom"])
+        return jsonify(statut="ok")
+    except sqlite3.Error:
+        # Aucun détail technique montré à l'utilisateur
+        return jsonify(erreur="Erreur interne"), 500
+    finally:
+        if con is not None:
+            con.close()
+
+
 # Démarrage du service des notes, sur ce poste uniquement
 if __name__ == "__main__":
     app.run(host=os.environ.get("APP_HOST", "127.0.0.1"), port=5000)
